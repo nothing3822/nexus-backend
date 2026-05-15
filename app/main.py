@@ -12,7 +12,7 @@ from app import models, auth, ws_manager
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Nexus Chat API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["https://nexus-frontend-sage.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["https://chat-with-mashori.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 manager = ws_manager.ConnectionManager()
 
 
