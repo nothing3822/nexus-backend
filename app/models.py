@@ -26,6 +26,8 @@ class User(Base):
     is_guest      = Column(Boolean, default=False)
     is_active     = Column(Boolean, default=True)
     status        = Column(String(20), default="offline")
+    custom_status = Column(String(100), nullable=True)
+    last_seen     = Column(DateTime(timezone=True), nullable=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
     messages         = relationship("Message", back_populates="sender")
