@@ -117,7 +117,7 @@ def _user_dict(user):
         "bio": user.bio,
         "status": user.status,
         "custom_status": getattr(user, "custom_status", None),
-        "last_seen": str(user.last_seen) if getattr(user, "last_seen", None) else None,
+        "last_seen": str(getattr(user, "last_seen", None)) if getattr(user, "last_seen", None) else None,
         "email_public": user.email_public,
         "searchable": user.searchable,
         "notifications_on": user.notifications_on,
@@ -153,8 +153,10 @@ def update_profile(data: ProfileUpdate, db: Session = Depends(get_db), current_u
     if data.status is not None and data.status in ("online", "away", "busy", "offline"):
         current_user.status = data.status
     if data.custom_status is not None:
-        if hasattr(current_user, "custom_status"):
+        try:
             current_user.custom_status = data.custom_status
+        except Exception:
+            pass
     db.commit()
     db.refresh(current_user)
     return _user_dict(current_user)
@@ -524,7 +526,7 @@ def my_connections(db: Session = Depends(get_db), current_user: models.User = De
                 "bio": other.bio,
                 "status": other.status,
                 "custom_status": getattr(other, "custom_status", None),
-                "last_seen": str(other.last_seen) if getattr(other, "last_seen", None) else None,
+                "last_seen": str(getattr(other, "last_seen", None)) if getattr(other, "last_seen", None) else None,
                 "avatar_base64": other.avatar_base64,
                 "room_id": c.dm_room_id,
             })
@@ -676,8 +678,10 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
         manager.disconnect(websocket, room_id, str(user.id))
         from datetime import datetime
         user.status = "offline"
-        if hasattr(user, "last_seen"):
+        try:
             user.last_seen = datetime.utcnow()
+        except Exception:
+            pass
         db.commit()
         await manager.broadcast(room_id, {"type": "presence", "user_id": str(user.id), "username": user.username, "status": "offline"})
 
