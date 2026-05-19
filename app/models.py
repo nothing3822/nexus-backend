@@ -19,6 +19,7 @@ class User(Base):
     password_hash = Column(Text, nullable=True)
     avatar_base64 = Column(Text, nullable=True)
     bio           = Column(String(300), default="")
+    custom_status = Column(String(100), nullable=True)
     email_public       = Column(Boolean, default=False)
     searchable         = Column(Boolean, default=True)
     profile_setup_done = Column(Boolean, default=False)
@@ -26,6 +27,7 @@ class User(Base):
     is_guest      = Column(Boolean, default=False)
     is_active     = Column(Boolean, default=True)
     status        = Column(String(20), default="offline")
+    last_seen     = Column(DateTime(timezone=True), nullable=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
     messages         = relationship("Message", back_populates="sender")

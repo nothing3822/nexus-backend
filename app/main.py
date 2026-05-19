@@ -11,6 +11,33 @@ from app import models, auth, ws_manager
 
 Base.metadata.create_all(bind=engine)
 
+# ── Auto-migration: naye columns add karo agar exist nahi karte ──
+def run_migrations():
+    with engine.connect() as conn:
+        # SQLite aur PostgreSQL dono ke liye kaam karta hai
+        try:
+            conn.execute(__import__('sqlalchemy').text("ALTER TABLE users ADD COLUMN custom_status VARCHAR(100)"))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute(__import__('sqlalchemy').text("ALTER TABLE users ADD COLUMN last_seen TIMESTAMP"))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute(__import__('sqlalchemy').text("UPDATE users SET searchable = 1 WHERE searchable IS NULL"))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute(__import__('sqlalchemy').text("UPDATE users SET searchable = TRUE WHERE searchable IS NULL"))
+            conn.commit()
+        except Exception:
+            pass
+
+run_migrations()
+
 app = FastAPI(title="Nexus Chat API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["https://chat-with-mashori.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 manager = ws_manager.ConnectionManager()
@@ -41,10 +68,13 @@ class ProfileUpdate(BaseModel):
     searchable: Optional[bool] = None
     notifications_on: Optional[bool] = None
     profile_setup_done: Optional[bool] = None
+    status: Optional[str] = None
+    custom_status: Optional[str] = None
 
 class RoomCreate(BaseModel):
     name: str
     room_type: str = "group"
+    description: Optional[str] = None
 
 class InviteCreate(BaseModel):
     room_id: Optional[str] = None
@@ -73,7 +103,10 @@ def signup(data: SignupData, db: Session = Depends(get_db)):
         username=data.username,
         email=data.email,
         password_hash=auth.hash_password(data.password),
-        profile_setup_done=False,   # Pehli baar → settings tab
+        profile_setup_done=False,
+        searchable=True,
+        notifications_on=True,
+        status="offline",
     )
     db.add(user)
     db.commit()
@@ -110,10 +143,12 @@ def _user_dict(user):
         "name": user.name,
         "username": user.username,
         "email": user.email if user.email_public else None,
-        "email_full": user.email,   # sirf apne liye
+        "email_full": user.email,
         "avatar_base64": user.avatar_base64,
         "bio": user.bio,
         "status": user.status,
+        "custom_status": getattr(user, 'custom_status', None),
+        "last_seen": str(user.last_seen) if getattr(user, 'last_seen', None) else None,
         "email_public": user.email_public,
         "searchable": user.searchable,
         "notifications_on": user.notifications_on,
@@ -146,16 +181,24 @@ def update_profile(data: ProfileUpdate, db: Session = Depends(get_db), current_u
         current_user.notifications_on = data.notifications_on
     if data.profile_setup_done is not None:
         current_user.profile_setup_done = data.profile_setup_done
+    if data.status is not None:
+        current_user.status = data.status
+    if data.custom_status is not None and hasattr(current_user, 'custom_status'):
+        current_user.custom_status = data.custom_status
     db.commit()
     db.refresh(current_user)
     return _user_dict(current_user)
 
 @app.get("/users/find/{username}")
 def find_user(username: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
+    # @ strip karo agar koi @username type kare
+    clean_username = username.lstrip("@").strip()
+    if not clean_username:
+        raise HTTPException(400, "Username empty hai")
     user = db.query(models.User).filter(
-        models.User.username == username,
+        models.User.username == clean_username,
         models.User.is_active == True,
-        models.User.searchable == True,       # Search restriction
+        models.User.searchable == True,
     ).first()
     if not user:
         raise HTTPException(404, "User not found or has disabled search")
@@ -174,9 +217,21 @@ def find_user(username: str, db: Session = Depends(get_db), current_user: models
         "username": user.username,
         "bio": user.bio,
         "status": user.status,
+        "custom_status": getattr(user, 'custom_status', None),
         "avatar_base64": user.avatar_base64,
         "connection_status": existing.status if existing else "none",
     }
+
+@app.post("/users/fix-searchable")
+def fix_searchable(db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
+    """Purane users ka searchable=True set karo — ek baar chalao"""
+    first_user = db.query(models.User).order_by(models.User.created_at).first()
+    if not first_user or str(current_user.id) != str(first_user.id):
+        raise HTTPException(403, "Admin only")
+    updated = db.query(models.User).filter(models.User.searchable == None).update({"searchable": True})
+    db.query(models.User).filter(models.User.searchable == False).update({"searchable": True})
+    db.commit()
+    return {"message": f"Fixed", "updated": updated}
 
 
 # ════════════════════════════════════════════════════════════
@@ -209,7 +264,7 @@ def read_all_notifications(db: Session = Depends(get_db), current_user: models.U
 # ════════════════════════════════════════════════════════════
 @app.post("/rooms", status_code=201)
 def create_room(data: RoomCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
-    room = models.Room(name=data.name, room_type=data.room_type, created_by=str(current_user.id))
+    room = models.Room(name=data.name, room_type=data.room_type, created_by=str(current_user.id), description=data.description)
     db.add(room)
     db.commit()
     db.refresh(room)
@@ -223,6 +278,28 @@ def my_rooms(db: Session = Depends(get_db), current_user: models.User = Depends(
     room_ids = [m.room_id for m in memberships]
     rooms = db.query(models.Room).filter(models.Room.id.in_(room_ids), models.Room.is_active == True).all()
     return [{"id": r.id, "name": r.name, "room_type": r.room_type, "created_at": str(r.created_at)} for r in rooms]
+
+@app.get("/rooms/{room_id}/members")
+def get_room_members(room_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
+    member_check = db.query(models.RoomMember).filter_by(room_id=room_id, user_id=str(current_user.id)).first()
+    if not member_check:
+        raise HTTPException(403, "Not a member")
+    members = db.query(models.RoomMember).filter_by(room_id=room_id).all()
+    result = []
+    room = db.query(models.Room).filter_by(id=room_id).first()
+    for m in members:
+        u = db.query(models.User).filter_by(id=m.user_id).first()
+        if u:
+            result.append({
+                "id": u.id,
+                "username": u.username,
+                "name": u.name,
+                "avatar_base64": u.avatar_base64,
+                "status": u.status,
+                "role": m.role,
+                "owner_id": room.created_by if room else None,
+            })
+    return result
 
 @app.delete("/rooms/{room_id}")
 def close_room(room_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
@@ -248,18 +325,31 @@ def get_messages(room_id: str, limit: int = 50, offset: int = 0, db: Session = D
     ).order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
     result = []
     for m in reversed(msgs):
-        # Seen by kitno ne
         seen_count = db.query(models.ReadReceipt).filter_by(message_id=m.id).count()
         seen_by_me = db.query(models.ReadReceipt).filter_by(message_id=m.id, user_id=str(current_user.id)).first() is not None
+        reply_to_data = None
+        if m.reply_to_id:
+            rt = db.query(models.Message).filter_by(id=m.reply_to_id).first()
+            if rt:
+                reply_to_data = {
+                    "id": rt.id,
+                    "content": rt.content,
+                    "sender_username": rt.sender.username if rt.sender else "Unknown",
+                    "sender_name": rt.sender.name if rt.sender else "Unknown",
+                }
         result.append({
             "id": m.id, "room_id": m.room_id, "sender_id": m.sender_id,
             "sender_username": m.sender.username if m.sender else "Unknown",
             "sender_name": m.sender.name if m.sender else "Unknown",
             "sender_avatar": m.sender.avatar_base64 if m.sender else None,
             "content": m.content, "message_type": m.message_type,
-            "reply_to_id": m.reply_to_id, "is_pinned": m.is_pinned,
+            "reply_to_id": m.reply_to_id,
+            "reply_to": reply_to_data,
+            "is_pinned": m.is_pinned,
+            "is_edited": m.edited_at is not None,
             "created_at": str(m.created_at),
             "seen_count": seen_count, "seen_by_me": seen_by_me,
+            "reactions": [],
         })
     return result
 
@@ -335,13 +425,11 @@ def use_invite(code: str, db: Session = Depends(get_db), current_user: models.Us
     result = {}
 
     if invite.room_id:
-        # Room join
         existing = db.query(models.RoomMember).filter_by(room_id=invite.room_id, user_id=str(current_user.id)).first()
         if not existing:
             db.add(models.RoomMember(room_id=invite.room_id, user_id=str(current_user.id)))
-        result = {"type": "room", "room_id": invite.room_id}
+        result = {"type": "room", "room_id": invite.room_id, "message": "Room join ho gaya!"}
     else:
-        # Direct connect via invite
         sender_id = invite.created_by
         blocked = db.query(models.Block).filter(
             ((models.Block.blocker_id == sender_id) & (models.Block.blocked_id == str(current_user.id))) |
@@ -356,9 +444,8 @@ def use_invite(code: str, db: Session = Depends(get_db), current_user: models.Us
         ).first()
 
         if existing_conn and existing_conn.status == "accepted":
-            result = {"type": "dm", "room_id": existing_conn.dm_room_id}
+            result = {"type": "dm", "room_id": existing_conn.dm_room_id, "message": "Pehle se connected hain!"}
         else:
-            # Auto accept — invite se aa raha hai to trusted
             dm_room = models.Room(
                 name=f"dm_{sender_id[:8]}_{current_user.id[:8]}",
                 room_type="direct",
@@ -371,9 +458,8 @@ def use_invite(code: str, db: Session = Depends(get_db), current_user: models.Us
                 db.add(models.RoomMember(room_id=str(dm_room.id), user_id=uid))
             conn = models.Connection(sender_id=sender_id, receiver_id=str(current_user.id), status="accepted", dm_room_id=str(dm_room.id))
             db.add(conn)
-            # Notification sender ko
             create_notification(db, sender_id, "connect_accepted", "New Connection!", f"{current_user.username} ne tumhara invite use kiya", str(dm_room.id))
-            result = {"type": "dm", "room_id": str(dm_room.id)}
+            result = {"type": "dm", "room_id": str(dm_room.id), "message": "Connected! 🎉"}
 
     invite.use_count += 1
     if invite.is_one_time:
@@ -407,7 +493,6 @@ def send_connect_request(username: str, db: Session = Depends(get_db), current_u
         raise HTTPException(400, "Request already bheji ja chuki hai")
     conn = models.Connection(sender_id=str(current_user.id), receiver_id=str(target.id), status="pending")
     db.add(conn)
-    # Notification
     create_notification(db, str(target.id), "connect_request", "Connect Request!", f"{current_user.username} ne connect request bheji", conn.id)
     db.commit()
     return {"message": f"{target.username} ko request bheji!"}
@@ -425,7 +510,6 @@ def accept_request(connection_id: str, db: Session = Depends(get_db), current_us
     for uid in [conn.sender_id, conn.receiver_id]:
         db.add(models.RoomMember(room_id=str(dm_room.id), user_id=uid))
     conn.dm_room_id = str(dm_room.id)
-    # Notification sender ko
     create_notification(db, conn.sender_id, "connect_accepted", "Request Accept Ho Gayi!", f"{current_user.username} ne tumhari request accept kar li", str(dm_room.id))
     db.commit()
     return {"message": "Connected!", "room_id": str(dm_room.id)}
@@ -459,7 +543,18 @@ def my_connections(db: Session = Depends(get_db), current_user: models.User = De
         other_id = c.receiver_id if c.sender_id == str(current_user.id) else c.sender_id
         other = db.query(models.User).filter_by(id=other_id).first()
         if other:
-            result.append({"connection_id": c.id, "user_id": other_id, "username": other.username, "name": other.name, "bio": other.bio, "status": other.status, "avatar_base64": other.avatar_base64, "room_id": c.dm_room_id})
+            result.append({
+                "connection_id": c.id,
+                "user_id": other_id,
+                "username": other.username,
+                "name": other.name,
+                "bio": other.bio,
+                "status": other.status,
+                "custom_status": getattr(other, 'custom_status', None),
+                "last_seen": str(other.last_seen) if getattr(other, 'last_seen', None) else None,
+                "avatar_base64": other.avatar_base64,
+                "room_id": c.dm_room_id,
+            })
     return result
 
 @app.post("/block/{username}")
@@ -537,6 +632,17 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
                 db.commit()
                 db.refresh(msg)
 
+                reply_to_data = None
+                if msg.reply_to_id:
+                    rt = db.query(models.Message).filter_by(id=msg.reply_to_id).first()
+                    if rt:
+                        reply_to_data = {
+                            "id": rt.id,
+                            "content": rt.content,
+                            "sender_username": rt.sender.username if rt.sender else "Unknown",
+                            "sender_name": rt.sender.name if rt.sender else "Unknown",
+                        }
+
                 payload = {
                     "type": "message",
                     "id": msg.id,
@@ -548,12 +654,14 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
                     "content": msg.content,
                     "message_type": msg.message_type,
                     "reply_to_id": msg.reply_to_id,
+                    "reply_to": reply_to_data,
                     "created_at": str(msg.created_at),
                     "seen_count": 0,
+                    "reactions": [],
+                    "is_edited": False,
                 }
                 await manager.broadcast(room_id, payload)
 
-                # Notification — jo online nahi hain unhe
                 members = db.query(models.RoomMember).filter_by(room_id=room_id).all()
                 for m in members:
                     if m.user_id != str(user.id):
@@ -572,6 +680,34 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
                         db.add(models.ReadReceipt(message_id=message_id, user_id=str(user.id)))
                         db.commit()
                     await manager.broadcast(room_id, {"type": "seen", "message_id": message_id, "user_id": str(user.id), "username": user.username})
+
+            elif event == "reaction":
+                message_id = data.get("message_id")
+                emoji = data.get("emoji")
+                if message_id and emoji:
+                    await manager.broadcast(room_id, {"type": "reaction", "message_id": message_id, "emoji": emoji, "user_id": str(user.id), "reactions": []})
+
+            elif event == "delete":
+                message_id = data.get("message_id")
+                if message_id:
+                    msg = db.query(models.Message).filter_by(id=message_id, sender_id=str(user.id)).first()
+                    if msg:
+                        msg.is_deleted = True
+                        msg.content = "This message was deleted"
+                        db.commit()
+                        await manager.broadcast(room_id, {"type": "delete", "message_id": message_id})
+
+            elif event == "edit":
+                message_id = data.get("message_id")
+                new_content = data.get("content", "").strip()
+                if message_id and new_content:
+                    from datetime import datetime
+                    msg = db.query(models.Message).filter_by(id=message_id, sender_id=str(user.id)).first()
+                    if msg:
+                        msg.content = new_content
+                        msg.edited_at = datetime.utcnow()
+                        db.commit()
+                        await manager.broadcast(room_id, {"type": "edit", "message_id": message_id, "content": new_content})
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id, str(user.id))
