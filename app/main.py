@@ -41,8 +41,6 @@ class ProfileUpdate(BaseModel):
     searchable: Optional[bool] = None
     notifications_on: Optional[bool] = None
     profile_setup_done: Optional[bool] = None
-    status: Optional[str] = None
-    custom_status: Optional[str] = None
 
 class RoomCreate(BaseModel):
     name: str
@@ -112,12 +110,10 @@ def _user_dict(user):
         "name": user.name,
         "username": user.username,
         "email": user.email if user.email_public else None,
-        "email_full": user.email,
+        "email_full": user.email,   # sirf apne liye
         "avatar_base64": user.avatar_base64,
         "bio": user.bio,
         "status": user.status,
-        "custom_status": getattr(user, "custom_status", None),
-        "last_seen": str(getattr(user, "last_seen", None)) if getattr(user, "last_seen", None) else None,
         "email_public": user.email_public,
         "searchable": user.searchable,
         "notifications_on": user.notifications_on,
@@ -150,13 +146,6 @@ def update_profile(data: ProfileUpdate, db: Session = Depends(get_db), current_u
         current_user.notifications_on = data.notifications_on
     if data.profile_setup_done is not None:
         current_user.profile_setup_done = data.profile_setup_done
-    if data.status is not None and data.status in ("online", "away", "busy", "offline"):
-        current_user.status = data.status
-    if data.custom_status is not None:
-        try:
-            current_user.custom_status = data.custom_status
-        except Exception:
-            pass
     db.commit()
     db.refresh(current_user)
     return _user_dict(current_user)
@@ -259,28 +248,18 @@ def get_messages(room_id: str, limit: int = 50, offset: int = 0, db: Session = D
     ).order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
     result = []
     for m in reversed(msgs):
+        # Seen by kitno ne
         seen_count = db.query(models.ReadReceipt).filter_by(message_id=m.id).count()
         seen_by_me = db.query(models.ReadReceipt).filter_by(message_id=m.id, user_id=str(current_user.id)).first() is not None
-        # seen_by list (names)
-        receipts = db.query(models.ReadReceipt).filter_by(message_id=m.id).all()
-        seen_by = []
-        for rr in receipts:
-            if rr.user_id != m.sender_id:  # sender khud count nahi hota
-                ru = db.query(models.User).filter_by(id=rr.user_id).first()
-                if ru:
-                    seen_by.append({"user_id": rr.user_id, "username": ru.username, "name": ru.name})
         result.append({
             "id": m.id, "room_id": m.room_id, "sender_id": m.sender_id,
             "sender_username": m.sender.username if m.sender else "Unknown",
             "sender_name": m.sender.name if m.sender else "Unknown",
             "sender_avatar": m.sender.avatar_base64 if m.sender else None,
             "content": m.content, "message_type": m.message_type,
-            "file_url": m.file_url,
             "reply_to_id": m.reply_to_id, "is_pinned": m.is_pinned,
             "created_at": str(m.created_at),
-            "is_edited": getattr(m, "is_edited", False),
             "seen_count": seen_count, "seen_by_me": seen_by_me,
-            "seen_by": seen_by,
         })
     return result
 
@@ -301,44 +280,6 @@ def delete_message(message_id: str, db: Session = Depends(get_db), current_user:
     msg.content = "This message was deleted"
     db.commit()
     return {"ok": True}
-
-@app.post("/rooms/{room_id}/pin/{message_id}")
-def pin_message(room_id: str, message_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
-    member = db.query(models.RoomMember).filter_by(room_id=room_id, user_id=str(current_user.id)).first()
-    if not member:
-        raise HTTPException(403, "Not a member")
-    # Unpin previous pinned messages in this room
-    db.query(models.Message).filter_by(room_id=room_id, is_pinned=True).update({"is_pinned": False})
-    msg = db.query(models.Message).filter_by(id=message_id, room_id=room_id).first()
-    if not msg:
-        raise HTTPException(404, "Message not found")
-    msg.is_pinned = True
-    db.commit()
-    return {"ok": True, "message_id": message_id}
-
-@app.delete("/rooms/{room_id}/pin")
-def unpin_message(room_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
-    member = db.query(models.RoomMember).filter_by(room_id=room_id, user_id=str(current_user.id)).first()
-    if not member:
-        raise HTTPException(403, "Not a member")
-    db.query(models.Message).filter_by(room_id=room_id, is_pinned=True).update({"is_pinned": False})
-    db.commit()
-    return {"ok": True}
-
-@app.get("/rooms/{room_id}/pinned")
-def get_pinned_message(room_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_user)):
-    member = db.query(models.RoomMember).filter_by(room_id=room_id, user_id=str(current_user.id)).first()
-    if not member:
-        raise HTTPException(403, "Not a member")
-    msg = db.query(models.Message).filter_by(room_id=room_id, is_pinned=True, is_deleted=False).first()
-    if not msg:
-        return None
-    return {
-        "id": msg.id, "content": msg.content, "message_type": msg.message_type,
-        "sender_username": msg.sender.username if msg.sender else "?",
-        "sender_name": msg.sender.name if msg.sender else "?",
-        "created_at": str(msg.created_at),
-    }
 
 
 # ════════════════════════════════════════════════════════════
@@ -518,18 +459,7 @@ def my_connections(db: Session = Depends(get_db), current_user: models.User = De
         other_id = c.receiver_id if c.sender_id == str(current_user.id) else c.sender_id
         other = db.query(models.User).filter_by(id=other_id).first()
         if other:
-            result.append({
-                "connection_id": c.id,
-                "user_id": other_id,
-                "username": other.username,
-                "name": other.name,
-                "bio": other.bio,
-                "status": other.status,
-                "custom_status": getattr(other, "custom_status", None),
-                "last_seen": str(getattr(other, "last_seen", None)) if getattr(other, "last_seen", None) else None,
-                "avatar_base64": other.avatar_base64,
-                "room_id": c.dm_room_id,
-            })
+            result.append({"connection_id": c.id, "user_id": other_id, "username": other.username, "name": other.name, "bio": other.bio, "status": other.status, "avatar_base64": other.avatar_base64, "room_id": c.dm_room_id})
     return result
 
 @app.post("/block/{username}")
@@ -596,19 +526,12 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
             event = data.get("type")
 
             if event == "message":
-                file_data = data.get("file_data")  # base64 for voice/image
-                file_url = None
-                # Store base64 data directly in file_url column (for small files)
-                if file_data:
-                    file_url = file_data  # base64 dataURL stored directly
-
                 msg = models.Message(
                     room_id=room_id,
                     sender_id=str(user.id),
                     content=data.get("content", ""),
                     message_type=data.get("message_type", "text"),
                     reply_to_id=data.get("reply_to_id"),
-                    file_url=file_url,
                 )
                 db.add(msg)
                 db.commit()
@@ -624,12 +547,9 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
                     "sender_avatar": user.avatar_base64,
                     "content": msg.content,
                     "message_type": msg.message_type,
-                    "file_url": file_url,
-                    "file_data": file_data,  # send back to all clients
                     "reply_to_id": msg.reply_to_id,
                     "created_at": str(msg.created_at),
                     "seen_count": 0,
-                    "seen_by": [],
                 }
                 await manager.broadcast(room_id, payload)
 
@@ -644,27 +564,6 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
             elif event == "typing":
                 await manager.broadcast(room_id, {"type": "typing", "user_id": str(user.id), "username": user.username, "is_typing": data.get("is_typing", False)}, exclude=websocket)
 
-            elif event == "pin":
-                message_id = data.get("message_id")
-                if message_id:
-                    db.query(models.Message).filter_by(room_id=room_id, is_pinned=True).update({"is_pinned": False})
-                    msg_to_pin = db.query(models.Message).filter_by(id=message_id, room_id=room_id).first()
-                    if msg_to_pin:
-                        msg_to_pin.is_pinned = True
-                        db.commit()
-                        await manager.broadcast(room_id, {
-                            "type": "pin",
-                            "message_id": message_id,
-                            "content": msg_to_pin.content,
-                            "message_type": msg_to_pin.message_type,
-                            "sender_username": user.username,
-                        })
-
-            elif event == "unpin":
-                db.query(models.Message).filter_by(room_id=room_id, is_pinned=True).update({"is_pinned": False})
-                db.commit()
-                await manager.broadcast(room_id, {"type": "unpin"})
-
             elif event == "seen":
                 message_id = data.get("message_id")
                 if message_id:
@@ -676,12 +575,7 @@ async def websocket_route(websocket: WebSocket, room_id: str, token: str, db: Se
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id, str(user.id))
-        from datetime import datetime
         user.status = "offline"
-        try:
-            user.last_seen = datetime.utcnow()
-        except Exception:
-            pass
         db.commit()
         await manager.broadcast(room_id, {"type": "presence", "user_id": str(user.id), "username": user.username, "status": "offline"})
 
